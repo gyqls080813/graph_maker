@@ -437,6 +437,121 @@ class DataSelector(tk.Toplevel):
 
         self.destroy()
 
+
+class HeaderRowDialog(tk.Toplevel):
+    """헤더 후보 행을 사용자에게 선택받는 다이얼로그."""
+
+    def __init__(self, parent, df: pd.DataFrame, recommended: int):
+        super().__init__(parent)
+        self.title("Select Header Row")
+        self.geometry("820x520")
+        self.transient(parent)
+        self.grab_set()
+        self.result = None
+        self.recommended = max(0, min(int(recommended or 0), max(len(df) - 1, 0)))
+        self.selected_row = None
+
+        info = ttk.Label(
+            self,
+            text=(
+                "데이터의 어느 행이 컬럼 헤더인지 선택하세요.\n"
+                "권장 행: #{rec} (더블클릭 또는 버튼으로 선택 가능)"
+            ).format(rec=self.recommended + 1),
+            justify="left",
+            wraplength=760,
+        )
+        info.pack(padx=10, pady=(12, 6), anchor="w")
+
+        frame = ttk.Frame(self)
+        frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        columns = ["Row #"] + [f"Col {i+1}" for i in range(df.shape[1])]
+        self.tree = ttk.Treeview(frame, columns=columns, show="headings", selectmode="browse")
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.grid_rowconfigure(0, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
+
+        for i, col in enumerate(columns):
+            heading = col if i == 0 else f"Column {i}"
+            width = 70 if i == 0 else 140
+            self.tree.heading(col, text=heading, anchor="w")
+            self.tree.column(col, width=width, anchor="w", stretch=i != 0)
+
+        display_rows = df.copy()
+        if len(display_rows) > 200 and self.recommended < len(display_rows):
+            hi = max(self.recommended + 30, 200)
+            display_rows = display_rows.iloc[:hi]
+        for idx, row in display_rows.iterrows():
+            values = [idx + 1]
+            for val in row:
+                if pd.isna(val):
+                    values.append("")
+                else:
+                    values.append(str(val))
+            self.tree.insert("", "end", iid=str(idx), values=values)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 12))
+
+        self.use_recommended_btn = ttk.Button(
+            btn_frame,
+            text=f"권장 행 사용 (#{self.recommended + 1})",
+            command=self._use_recommended,
+        )
+        self.use_recommended_btn.pack(side="left")
+
+        self.use_selected_btn = ttk.Button(
+            btn_frame,
+            text="선택한 행 사용",
+            state="disabled",
+            command=self._use_selected,
+        )
+        self.use_selected_btn.pack(side="left", padx=(8, 0))
+
+        ttk.Button(btn_frame, text="취소", command=self._cancel).pack(side="right")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-Button-1>", self._on_double_click)
+
+        if str(self.recommended) in self.tree.get_children():
+            self.tree.selection_set(str(self.recommended))
+            self.tree.see(str(self.recommended))
+            self.selected_row = self.recommended
+            self.use_selected_btn.config(state="normal")
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _on_select(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            self.selected_row = None
+            self.use_selected_btn.config(state="disabled")
+            return
+        self.selected_row = int(sel[0])
+        self.use_selected_btn.config(state="normal")
+
+    def _on_double_click(self, event=None):
+        self._use_selected()
+
+    def _use_recommended(self):
+        self.result = self.recommended
+        self.destroy()
+
+    def _use_selected(self):
+        if self.selected_row is None:
+            return
+        self.result = self.selected_row
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
 # ------------------------------- 
 # Style helpers
 # ------------------------------- 
@@ -1028,7 +1143,7 @@ class GraphMaker(tk.Tk):
     def _create_data_tab(self, parent):
         f1 = ttk.LabelFrame(parent, text="Data Source", padding=10)
         f1.pack(fill="x", pady=6)
-        ttk.Button(f1, text="Load Excel File", command=self.load_excel).pack(fill="x")
+        ttk.Button(f1, text="Load Data File", command=self.load_data_file).pack(fill="x")
         self.file_label = ttk.Label(f1, text="No file selected.", wraplength=360)
         self.file_label.pack(pady=5, fill="x")
 
@@ -1515,7 +1630,7 @@ class GraphMaker(tk.Tk):
 
         # 선택된 컬럼 기준으로 X/Y 동기화
         self._map_columns_from_selection()
-        self._refresh_axis_selectors()
+        self._auto_pick_xy_from_selection()
         self._schedule_axis_and_plot()
 
     def _map_columns_from_selection(self):
@@ -1593,17 +1708,7 @@ class GraphMaker(tk.Tk):
                 # EIS가 아니거나 후보가 없을 때 안전 기본값
                 self.y_listbox.selection_set(0)
 
-    def open_data_selector(self):
-        if self.df is None:
-            return
-        sel = DataSelector(self, self.df)
-        self.wait_window(sel)
-        # 선택한 행/열 기반으로 X/Y 후보 재선정
-        self._auto_pick_xy_from_selection()
-        # 축/플롯 갱신
-        self._refresh_axis_selectors()
-        self._auto_pick_xy_from_selection()   # <- 추가
-        self._schedule_axis_and_plot()
+
 
     def _is_numeric_series(self, s) -> bool:
         try:
@@ -1629,11 +1734,11 @@ class GraphMaker(tk.Tk):
             if has_keywords(s.iloc[i].tolist()):
                 return i
 
-        for i in range(nrows-1):
+        for i in range(max(nrows - 1, 0)):
             # i를 헤더로 가정했을 때 i+1 이후 행에서 숫자열이 2개 이상이면 채택
             num_cols = 0
             for c in range(s.shape[1]):
-                col_after = pd.to_numeric(df_raw.iloc[i+1:, c], errors="coerce")
+                col_after = pd.to_numeric(df_raw.iloc[i + 1 :, c], errors="coerce")
                 if col_after.notna().sum() >= max(2, int(len(col_after) * 0.6)):
                     num_cols += 1
             if num_cols >= 2:
@@ -1676,39 +1781,74 @@ class GraphMaker(tk.Tk):
 
         return df
 
-    def _cleanup_table(self, df_raw: pd.DataFrame) -> pd.DataFrame:
+    def _normalize_column_names(self, columns) -> list[str]:
+        fixed = []
+        seen = set()
+        for i, name in enumerate(columns):
+            nm = str(name).strip() if name is not None else ""
+            if not nm:
+                nm = f"col{i+1}"
+            if nm in seen:
+                nm = f"{nm}_{i+1}"
+            seen.add(nm)
+            fixed.append(nm)
+        return fixed
+
+    def _convert_numeric_columns(self, df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        for c in df.columns:
+            try:
+                conv = pd.to_numeric(df[c], errors="coerce")
+                if conv.notna().sum() > 0:
+                    df[c] = conv
+            except Exception:
+                pass
+        return df
+
+    def _prompt_header_row(self, df0: pd.DataFrame, recommended: int) -> int:
+        dialog = HeaderRowDialog(self, df0, recommended)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return recommended
+        return max(0, min(int(dialog.result), len(df0) - 1))
+
+    def _cleanup_table(
+        self,
+        df_raw: pd.DataFrame,
+        *,
+        headerless: bool = True,
+        allow_prompt: bool = True,
+    ) -> pd.DataFrame:
         df0 = df_raw.dropna(axis=0, how="all").dropna(axis=1, how="all")
         if df0.empty:
             return df0
-        hdr = self._find_header_row(df0)
-        header_vals = [str(v).strip() for v in df0.iloc[hdr].tolist()]
-        # 중복/빈 헤더 보정
-        fixed = []
-        seen = set()
-        for i, name in enumerate(header_vals):
-            nm = name if name else f"col{i+1}"
-            if nm in seen: nm = f"{nm}_{i+1}"
-            seen.add(nm); fixed.append(nm)
-        df = df0.iloc[hdr+1:].copy()
-        df.columns = fixed[:df.shape[1]]
-        # 숫자열 캐스팅
-        for c in df.columns:
-            try:
-                if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0:
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            except Exception:
-                pass
+        df0 = df0.reset_index(drop=True)
+
+        if headerless:
+            hdr = self._find_header_row(df0)
+            if allow_prompt and len(df0) > 1:
+                hdr = self._prompt_header_row(df0, hdr)
+            hdr = max(0, min(int(hdr), len(df0) - 1))
+            header_vals = [str(v).strip() for v in df0.iloc[hdr].tolist()]
+            fixed = self._normalize_column_names(header_vals)
+            df = df0.iloc[hdr + 1 :].reset_index(drop=True)
+            df.columns = fixed[: df.shape[1]]
+        else:
+            df = df0.copy()
+            df.columns = self._normalize_column_names(df.columns)
+
+        df = self._convert_numeric_columns(df)
         return self._coerce_eis_headers(df)
 
-    def load_excel(self):
+    def load_data_file(self):
         path = filedialog.askopenfilename(
             filetypes=[
-                ("All supported", "*.xlsx *.xls *.xlsm *.csv *.tsv *.txt *.mpr"),
-                ("Excel", "*.xlsx *.xls *.xlsm"),
+                ("Supported files", "*.xml *.csv *.txt *.mpr *.tsv *.xlsx *.xls *.xlsm"),
+                ("XML", "*.xml"),
                 ("CSV", "*.csv"),
-                ("TSV", "*.tsv"),
-                ("Text", "*.txt"),
+                ("Text", "*.txt *.tsv"),
                 ("Bio-Logic MPR", "*.mpr"),
+                ("Excel", "*.xlsx *.xls *.xlsm"),
                 ("All files", "*.*"),
             ]
         )
@@ -1719,8 +1859,10 @@ class GraphMaker(tk.Tk):
             lower = path.lower()
             if lower.endswith((".xlsx", ".xls", ".xlsm")):
                 df = self._read_excel_smart(path)
+            elif lower.endswith(".xml"):
+                df = self._read_xml(path)
             elif lower.endswith(".tsv"):
-                df = self._read_txt_like(path)  # 탭도 자동 인식
+                df = self._read_txt_like(path)
             elif lower.endswith(".csv") or lower.endswith(".txt"):
                 df = self._read_txt_like(path)
             elif lower.endswith(".mpr"):
@@ -1743,9 +1885,7 @@ class GraphMaker(tk.Tk):
             self.selected_columns = list(self.df.columns)
             self.select_btn.config(state="normal")
 
-            self._refresh_axis_selectors()
-            # 선택 컬럼 기준으로 X/Y 매핑
-            self._map_columns_from_selection()
+            self._auto_pick_xy_from_selection()
 
         except Exception as e:
             self.file_label.config(text=f"Error: {e}")
@@ -1776,14 +1916,71 @@ class GraphMaker(tk.Tk):
             df_raw = self._read_csv_smart(path, sep=None)  # 구분자/인코딩 자동 + header=None
         except Exception:
             df_raw = pd.read_csv(path, delim_whitespace=True, engine="python", header=None)
-        return self._cleanup_table(df_raw)
+        return self._cleanup_table(df_raw, headerless=True, allow_prompt=True)
 
     def _read_excel_smart(self, path: str) -> pd.DataFrame:
         try:
             df_raw = pd.read_excel(path, header=None)
         except Exception:
             df_raw = pd.read_excel(path, header=None, engine="openpyxl")
-        return self._cleanup_table(df_raw)
+        return self._cleanup_table(df_raw, headerless=True, allow_prompt=True)
+
+    def _read_xml(self, path: str) -> pd.DataFrame:
+        try:
+            df_raw = pd.read_xml(path)
+            if df_raw is not None and not df_raw.empty:
+                return self._cleanup_table(df_raw, headerless=False, allow_prompt=False)
+        except Exception:
+            df_raw = None
+
+        if df_raw is None or df_raw.empty:
+            try:
+                import xml.etree.ElementTree as ET
+
+                tree = ET.parse(path)
+                root = tree.getroot()
+
+                def collect_records(node):
+                    children = list(node)
+                    if not children:
+                        return []
+                    records = []
+                    for child in children:
+                        record = {}
+                        if child.attrib:
+                            record.update({k: v for k, v in child.attrib.items()})
+                        sub_children = list(child)
+                        if sub_children:
+                            for sub in sub_children:
+                                if list(sub):
+                                    continue
+                                text = (sub.text or "").strip()
+                                if text:
+                                    record[sub.tag] = text
+                                for ak, av in sub.attrib.items():
+                                    record[f"{sub.tag}_{ak}"] = av
+                        else:
+                            text = (child.text or "").strip()
+                            if text:
+                                record[child.tag] = text
+                        if record:
+                            records.append(record)
+                    if records:
+                        return records
+                    for child in children:
+                        nested = collect_records(child)
+                        if nested:
+                            return nested
+                    return []
+
+                records = collect_records(root)
+                if not records:
+                    raise ValueError("Failed to parse XML file.")
+                df_raw = pd.DataFrame(records)
+            except Exception as err:
+                raise ValueError(f"Failed to read XML file: {err}") from err
+
+        return self._cleanup_table(df_raw, headerless=False, allow_prompt=False)
 
     def _read_mpr(self, path: str) -> pd.DataFrame:
         if _eclab is not None:
