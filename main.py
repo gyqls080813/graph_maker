@@ -217,6 +217,7 @@ class DataSelector(tk.Toplevel):
         self.sel_col_hi = None
 
         self.assign_first_as_x = tk.BooleanVar(value=True)  # 첫 선택을 X, 나머지 Y
+        self.manual_x_col = tk.StringVar(value="")        # 사용자 지정 X 컬럼
 
         # Paned
         self.paned_window = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
@@ -245,6 +246,17 @@ class DataSelector(tk.Toplevel):
             text="Use first selected\ncolumn as X",
             variable=self.assign_first_as_x
         ).pack(anchor="w", pady=(0,8))
+
+        ttk.Label(right, text="Manual X column:").pack(anchor="w")
+        self.manual_x_combo = ttk.Combobox(right, textvariable=self.manual_x_col, values=[], state="disabled")
+        self.manual_x_combo.pack(fill="x", pady=(0,8))
+
+        # 체크박스 변경 시 콤보박스 활성화/비활성화
+        try:
+            self.assign_first_as_x.trace_add("write", lambda *a: self._update_manual_x_state())
+        except AttributeError:
+            self.assign_first_as_x.trace("w", lambda *a: self._update_manual_x_state())
+        self._update_manual_x_state()
 
         ttk.Button(right, text="Apply Selection", command=self.apply_selection).pack(fill="x", side="bottom")
 
@@ -387,6 +399,14 @@ class DataSelector(tk.Toplevel):
             self._scroll_job = self.after(30, self._auto_scroll_tick)
 
     # ---------- UI update ----------
+    def _update_manual_x_state(self, *args):
+        if not hasattr(self, "manual_x_combo"):
+            return
+        if self.assign_first_as_x.get():
+            self.manual_x_combo.configure(state="disabled")
+        else:
+            self.manual_x_combo.configure(state="readonly")
+
     def _update_visual_selection(self):
         self.tree.selection_set()
         if self.sel_row_lo is not None and self.sel_row_hi is not None:
@@ -408,6 +428,16 @@ class DataSelector(tk.Toplevel):
 
         lo, hi_excl = self._selected_data_slice()
         sel_names = self.data_cols[lo:hi_excl]
+
+        if hasattr(self, "manual_x_combo"):
+            self.manual_x_combo["values"] = sel_names
+            if self.assign_first_as_x.get() and sel_names:
+                self.manual_x_col.set(sel_names[0])
+            else:
+                if self.manual_x_col.get() not in sel_names:
+                    self.manual_x_col.set(sel_names[0] if sel_names else "")
+            self._update_manual_x_state()
+
         cols_str = ", ".join(sel_names) if sel_names else "(none)"
         rows_str = "(none)"
         if self.sel_row_lo is not None and self.sel_row_hi is not None:
@@ -415,6 +445,10 @@ class DataSelector(tk.Toplevel):
 
         if self.assign_first_as_x.get() and sel_names:
             preview = f"X = {sel_names[0]}\nY = {', '.join(sel_names[1:]) or '(none)'}"
+        elif self.manual_x_col.get() and self.manual_x_col.get() in sel_names:
+            manual_x = self.manual_x_col.get()
+            y_candidates = [c for c in sel_names if c != manual_x]
+            preview = f"X = {manual_x}\nY = {', '.join(y_candidates) or '(none)'}"
         else:
             preview = "(no auto mapping)"
 
@@ -427,12 +461,16 @@ class DataSelector(tk.Toplevel):
             self.parent.end_row.set(str(self.sel_row_hi + 1))
 
         lo, hi_excl = self._selected_data_slice()
-        self.parent.selected_columns = self.data_cols[lo:hi_excl]
+        selected_cols = self.data_cols[lo:hi_excl]
+        self.parent.selected_columns = selected_cols
 
-        # 자동 매핑
-        if self.assign_first_as_x.get():
-            try: self.parent._map_columns_from_selection()
-            except Exception: pass
+        prefer_x = None
+        if self.assign_first_as_x.get() and selected_cols:
+            prefer_x = selected_cols[0]
+        elif self.manual_x_col.get() and self.manual_x_col.get() in selected_cols:
+            prefer_x = self.manual_x_col.get()
+
+        self.parent._preferred_x_after_selection = prefer_x
 
         self.destroy()
 
@@ -522,6 +560,7 @@ class GraphMaker(tk.Tk):
 
         # DataSelector에서 넘어온 선택 컬럼
         self.selected_columns = []
+        self._preferred_x_after_selection = None
         self._underline_lines = []
 
         # ---- 스타일 오브젝트(타이틀/라벨/틱 등) ----
@@ -986,7 +1025,7 @@ class GraphMaker(tk.Tk):
     def _create_data_tab(self, parent):
         f1 = ttk.LabelFrame(parent, text="Data Source", padding=10)
         f1.pack(fill="x", pady=6)
-        ttk.Button(f1, text="Load Excel File", command=self.load_excel).pack(fill="x")
+        ttk.Button(f1, text="Load Data File (Excel/CSV/TXT/MPR)", command=self.load_excel).pack(fill="x")
         self.file_label = ttk.Label(f1, text="No file selected.", wraplength=360)
         self.file_label.pack(pady=5, fill="x")
 
@@ -1465,19 +1504,27 @@ class GraphMaker(tk.Tk):
         self.styleable_objects["X-Tick Labels"] = StyleableObject("X-Tick Labels", 'tick', StyleConfig())
         self.styleable_objects["Y-Tick Labels"] = StyleableObject("Y-Tick Labels", 'tick', StyleConfig())
 
-    def _map_columns_from_selection(self):
-        """self.selected_columns: X=첫 번째, Y=그 외로 UI 반영"""
+    def _map_columns_from_selection(self, prefer_x=None):
+        """
+        self.selected_columns를 기준으로 축을 매핑한다.
+        prefer_x가 주어지면 해당 컬럼을 우선적으로 X로 사용하고,
+        나머지는 선택된 순서를 유지하여 Y 후보로 설정한다.
+        """
         if self.df is None:
             return
         cols = [c for c in (self.selected_columns or []) if c in self.df.columns]
         if not cols:
             return
-        self.x_col.set(cols[0])
+        ordered_cols = cols
+        if prefer_x and prefer_x in cols:
+            ordered_cols = [prefer_x] + [c for c in cols if c != prefer_x]
+
+        self.x_col.set(ordered_cols[0])
         self._refresh_axis_selectors()
         if hasattr(self, "y_listbox") and self.y_listbox.size() > 0:
             self.y_listbox.selection_clear(0, "end")
             items = [self.y_listbox.get(i) for i in range(self.y_listbox.size())]
-            for c in cols[1:]:
+            for c in ordered_cols[1:]:
                 if c in items:
                     self.y_listbox.selection_set(items.index(c))
 
@@ -1543,10 +1590,16 @@ class GraphMaker(tk.Tk):
     def open_data_selector(self):
         if self.df is None:
             return
+        self._preferred_x_after_selection = None
         sel = DataSelector(self, self.df)
         self.wait_window(sel)
-        # 선택한 행/열 기반으로 X/Y 후보 재선정 및 축 갱신
-        self._auto_pick_xy_from_selection()
+        prefer_x = getattr(self, "_preferred_x_after_selection", None)
+        if prefer_x and prefer_x in (self.selected_columns or []):
+            self._map_columns_from_selection(prefer_x=prefer_x)
+        else:
+            # 선택한 행/열 기반으로 X/Y 후보 재선정 및 축 갱신
+            self._auto_pick_xy_from_selection()
+        self._preferred_x_after_selection = None
         self._schedule_axis_and_plot()
 
     def _is_numeric_series(self, s) -> bool:
@@ -1685,11 +1738,12 @@ class GraphMaker(tk.Tk):
             self.file_label.config(text="Loaded: " + path.replace("\\","/").split("/")[-1])
             self.start_row.set("1"); self.end_row.set(str(len(self.df)))
             self.selected_columns = list(self.df.columns)
+            self._preferred_x_after_selection = None
             self.select_btn.config(state="normal")
 
             self._refresh_axis_selectors()
             # 선택 컬럼 기준으로 X/Y 매핑
-            self._map_columns_from_selection()
+            self._auto_pick_xy_from_selection()
 
         except Exception as e:
             self.file_label.config(text=f"Error: {e}")
