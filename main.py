@@ -509,13 +509,14 @@ class StyleConfig:
 
 
 class StyleableObject:
-    def __init__(self, name, obj_type, style_config, text_var=None, x_var=None, y_var=None):
+    def __init__(self, name, obj_type, style_config, text_var=None, x_var=None, y_var=None, meta=None):
         self.name = name
         self.obj_type = obj_type
         self.style = style_config
         self.text = text_var
         self.x = x_var
         self.y = y_var
+        self.meta = dict(meta) if meta else {}
 
 
 # ------------------------------- 
@@ -592,6 +593,7 @@ class GraphMaker(tk.Tk):
 
         # ★ 회귀식 위치/포맷/표시 제어(신규)
         self.series_eq_place = {}             # {col: StringVar('legend'|'onplot'|'none')}
+        self._series_eq_place_choice = {}     # {col: str}  실제 선택값 캐시(트렌드 토글 등으로 값 초기화 방지)
         self.series_custom_legend_text = {}   # {col: StringVar}
         self.series_use_custom_legend = {}    # {col: BooleanVar}
         self.series_last_eq = {}              # {col: StringVar}  # 계산된 최신 식(읽기)
@@ -720,12 +722,27 @@ class GraphMaker(tk.Tk):
             self.plot_graph()
 
     # ---------- utility ----------
+    def _cancel_pending_plot(self):
+        if self._pending_plot_job is not None:
+            try:
+                self.after_cancel(self._pending_plot_job)
+            except Exception:
+                pass
+            self._pending_plot_job = None
+
+    def _plot_graph_now(self):
+        self._cancel_pending_plot()
+        self.plot_graph()
+
+    def _axis_and_plot_now(self):
+        self._cancel_pending_plot()
+        self._update_axis_defaults()
+        self.plot_graph()
+
     def _schedule_plot(self, delay=None):
         if delay is None:
             delay = self._debounce_ms
-        if self._pending_plot_job is not None:
-            try: self.after_cancel(self._pending_plot_job)
-            except Exception: pass
+        self._cancel_pending_plot()
         self._pending_plot_job = self.after(delay, self._do_plot)
 
     def _do_plot(self):
@@ -733,9 +750,7 @@ class GraphMaker(tk.Tk):
         self.plot_graph()
 
     def _schedule_axis_and_plot(self):
-        if self._pending_plot_job is not None:
-            try: self.after_cancel(self._pending_plot_job)
-            except Exception: pass
+        self._cancel_pending_plot()
         self._pending_plot_job = self.after(self._debounce_ms, self._do_axis_and_plot)
 
     def _do_axis_and_plot(self):
@@ -753,15 +768,20 @@ class GraphMaker(tk.Tk):
         self._pending_series_job = None
         self._build_series_panel(col)
 
-    def _apply_underline(self, artist, enabled: bool):
-        """가능하면 Text.set_underline(True) 사용, 안 되면 False 반환하여 폴백(라인)을 쓰게 한다."""
+    def _apply_underline(self, artist, enabled: bool, *, axis=None, pad_px=2, fallback_targets=None):
+        """텍스트 밑줄을 적용. set_underline 지원 시 사용, 아니면 폴백 라인에 등록."""
+        success = False
         try:
             if hasattr(artist, "set_underline"):
                 artist.set_underline(bool(enabled))
-                return True
+                success = True
         except Exception:
-            pass
-        return False
+            success = False
+
+        if enabled and not success and axis is not None and fallback_targets is not None:
+            fallback_targets.append((artist, axis, pad_px))
+
+        return success
 
 
     def _cycle_color(self, i):
@@ -826,7 +846,8 @@ class GraphMaker(tk.Tk):
                     f"Equation [{col}]", 'text',
                     StyleConfig(color=self._cycle_color(i), size='10'),
                     text_var=tk.StringVar(value=""),
-                    x_var=tk.DoubleVar(value=0), y_var=tk.DoubleVar(value=0)
+                    x_var=tk.DoubleVar(value=0), y_var=tk.DoubleVar(value=0),
+                    meta={"auto_pos": True}
                 )
             if col not in self.series_show_trend:
                 self.series_show_trend[col] = tk.BooleanVar(value=False)
@@ -838,9 +859,25 @@ class GraphMaker(tk.Tk):
                 self.series_eq_in_legend[col] = tk.BooleanVar(value=False)
 
             # --- 신규 옵션들 ---
+            if col not in self._series_eq_place_choice:
+                self._series_eq_place_choice[col] = "legend"
+
             if col not in self.series_eq_place:
                 # 기본값: 범례에 "열이름 (식)" 형태로 들어가게
-                self.series_eq_place[col] = tk.StringVar(value="legend")
+                initial_place = self._series_eq_place_choice.get(col, "legend")
+                var = tk.StringVar(value=initial_place)
+
+                def _sync_place(*_args, _col=col):
+                    raw = (self.series_eq_place[_col].get() or "").strip()
+                    if raw:
+                        self._series_eq_place_choice[_col] = raw.lower()
+
+                var.trace_add("write", _sync_place)
+                self.series_eq_place[col] = var
+            else:
+                desired = self._series_eq_place_choice.get(col)
+                if desired is not None and (self.series_eq_place[col].get() or "") != desired:
+                    self.series_eq_place[col].set(desired)
             if col not in self.series_custom_legend_text:
                 self.series_custom_legend_text[col] = tk.StringVar(value="")
             if col not in self.series_use_custom_legend:
@@ -866,6 +903,19 @@ class GraphMaker(tk.Tk):
 
 
 
+    def _get_series_eq_place(self, col: str) -> str:
+        """현재 시리즈의 식 위치 설정을 안전하게 반환."""
+        cached = getattr(self, "_series_eq_place_choice", {}).get(col)
+        if cached:
+            return cached.lower()
+        var = self.series_eq_place.get(col)
+        if var:
+            val = (var.get() or "").strip()
+            if val:
+                return val.lower()
+        return "legend"
+
+
     def _refresh_axis_selectors(self):
         cols = self._available_columns()
 
@@ -889,7 +939,32 @@ class GraphMaker(tk.Tk):
                 self.y_listbox.insert("end", c)
         
 
+    def _event_requests_immediate(self, event):
+        if event is None:
+            return True
+
+        keysym = getattr(event, "keysym", "") or ""
+        if keysym in ("Return", "KP_Enter"):
+            return True
+
+        event_type_obj = getattr(event, "type", None)
+        try:
+            if event_type_obj in (tk.EventType.FocusOut, tk.EventType.VirtualEvent):
+                return True
+        except Exception:
+            pass
+
+        event_type = str(event_type_obj).lower()
+        if "virtual" in event_type or "focusout" in event_type:
+            return True
+
+        return False
+
     def _plot_graph_event(self, event=None):
+        if self._event_requests_immediate(event):
+            self._plot_graph_now()
+            return
+
         self._schedule_plot()
 
     # ---------- UI ----------
@@ -1017,6 +1092,9 @@ class GraphMaker(tk.Tk):
 
         # ★ 엔터/포커스아웃 시 즉시 반영: 축 범위/간격 변경 → 바로 재그리기
         def _axis_changed(_evt=None):
+            if self._event_requests_immediate(_evt):
+                self._plot_graph_now()  # 입력값을 그대로 적용하여 즉시 재그리기
+                return
             self._schedule_plot()  # 여기서는 기본값 재계산 없이, 입력값을 그대로 적용하여 그리기
         for e in (x_min_e, x_max_e, x_int_e, y_min_e, y_max_e, y_int_e):
             e.bind("<Return>", _axis_changed)
@@ -1059,6 +1137,9 @@ class GraphMaker(tk.Tk):
 
         # 엔터/포커스아웃 시 즉시 반영: 행 범위 변경 → 축 기본값 재계산 + 재그리기
         def _rows_changed(_evt=None):
+            if self._event_requests_immediate(_evt):
+                self._axis_and_plot_now()
+                return
             self._schedule_axis_and_plot()
         e_start.bind("<Return>", _rows_changed)
         e_end.bind("<Return>", _rows_changed)
@@ -1116,6 +1197,9 @@ class GraphMaker(tk.Tk):
 
         # ★ 엔터/포커스아웃 시 즉시 반영
         def _legend_changed(_evt=None):
+            if self._event_requests_immediate(_evt):
+                self._plot_graph_now()
+                return
             self._schedule_plot()
         for e in (fs_e, lw_e, fc_e, ec_e):
             e.bind("<Return>", _legend_changed)
@@ -1142,22 +1226,63 @@ class GraphMaker(tk.Tk):
         f_grid.grid_columnconfigure(0, weight=1)
         f_grid.grid_columnconfigure(1, weight=1)
 
-    def _calculate_axis_defaults(self, data_min, data_max):
-        """숫자형 데이터용 '예쁜' 기본 범위/간격."""
-        if data_min is None or data_max is None or pd.isna(data_min) or pd.isna(data_max):
+    def _calculate_axis_defaults(self, data_min, data_max, *, snap_zero_min=False):
+        """숫자형 데이터 범위/간격 계산.
+
+        snap_zero_min이 True이고 데이터가 모두 양수면 0부터 시작하도록 한다.
+        그렇지 않으면 실제 데이터의 최솟값에서 시작한다.
+        """
+        if data_min is None or data_max is None:
             return "0", "10", "2"
-        nice_min = 0
-        rng = data_max - nice_min
-        if rng <= 0:
-            rng = data_max if data_max > 0 else 1.0
-        power = 10 ** math.floor(math.log10(rng))
-        nice_max = math.ceil(data_max / power) * power
-        if nice_max <= nice_min:
-            nice_max = data_max + power
-        interval = (nice_max - nice_min) / 10.0
-        if interval <= 0:
-            interval = 1.0
-        return str(nice_min), str(round(nice_max, 6)), str(round(interval, 6))
+        try:
+            data_min = float(data_min)
+            data_max = float(data_max)
+        except Exception:
+            return "0", "10", "2"
+
+        if math.isnan(data_min) or math.isnan(data_max):
+            return "0", "10", "2"
+
+        if data_min > data_max:
+            data_min, data_max = data_max, data_min
+
+        if math.isclose(data_min, data_max, rel_tol=1e-9, abs_tol=1e-9):
+            span = abs(data_max) if data_max != 0 else 1.0
+            data_min -= span / 2.0
+            data_max += span / 2.0
+
+        span = data_max - data_min
+        if span <= 0:
+            span = abs(data_max) if data_max != 0 else 1.0
+            data_max = data_min + span
+
+        raw_step = span / 10.0 if span > 0 else 1.0
+        if raw_step <= 0:
+            raw_step = 1.0
+
+        exp = math.floor(math.log10(raw_step))
+        base = 10 ** exp
+        for mult in (1, 2, 5, 10):
+            step = mult * base
+            if step >= raw_step:
+                break
+        else:
+            step = base * 10
+
+        if snap_zero_min and data_min >= 0:
+            nice_min = 0.0
+        else:
+            nice_min = math.floor(data_min / step) * step
+
+        nice_max = math.ceil(data_max / step) * step
+        if math.isclose(nice_max, nice_min):
+            nice_max = nice_min + step
+
+        return (
+            str(round(nice_min, 6)),
+            str(round(nice_max, 6)),
+            str(round(step, 6))
+        )
 
 
     def _update_axis_defaults(self):
@@ -1186,8 +1311,12 @@ class GraphMaker(tk.Tk):
         else:
             x = pd.to_numeric(xser_raw, errors="coerce").dropna()
             if not x.empty:
-                xmin, xmax, xint = self._calculate_axis_defaults(x.min(), x.max())
-                self.x_min.set(xmin); self.x_max.set(xmax); self.x_interval.set(xint)
+                x_actual_min = float(x.min())
+                x_actual_max = float(x.max())
+                _, _, xint = self._calculate_axis_defaults(x_actual_min, x_actual_max, snap_zero_min=False)
+                self.x_min.set(str(round(x_actual_min, 6)))
+                self.x_max.set(str(round(x_actual_max, 6)))
+                self.x_interval.set(xint)
 
         # Y min/max
         y_cols = self._get_selected_y_cols() or []
@@ -1205,7 +1334,10 @@ class GraphMaker(tk.Tk):
 
         y_all_min = min(s.min() for s in ys)
         y_all_max = max(s.max() for s in ys)
-        y_min, y_max, y_int = self._calculate_axis_defaults(y_all_min, y_all_max)
+        y_min, y_max, y_int = self._calculate_axis_defaults(
+            y_all_min, y_all_max,
+            snap_zero_min=(y_all_min >= 0)
+        )
         self.y_min.set(y_min); self.y_max.set(y_max); self.y_interval.set(y_int)
 
 
@@ -1323,6 +1455,13 @@ class GraphMaker(tk.Tk):
             xe.bind("<Return>", self._plot_graph_event); xe.bind("<FocusOut>", self._plot_graph_event)
             ye.bind("<Return>", self._plot_graph_event); ye.bind("<FocusOut>", self._plot_graph_event)
 
+            def _stop_auto(_evt=None, target=obj):
+                if hasattr(target, "meta"):
+                    target.meta["auto_pos"] = False
+
+            xe.bind("<Key>", _stop_auto, add="+")
+            ye.bind("<Key>", _stop_auto, add="+")
+
         parent.grid_columnconfigure(1, weight=1)
         parent.grid_columnconfigure(3, weight=1)
 
@@ -1386,10 +1525,15 @@ class GraphMaker(tk.Tk):
         xsym.bind("<Return>", self._plot_graph_event); xsym.bind("<FocusOut>", self._plot_graph_event)
 
         ttk.Label(f_trend, text="Number format").grid(row=2, column=0, sticky="w", pady=(6,0))
-        ttk.Combobox(f_trend, state="readonly",
-                    values=["sigfigs","fixed","sci"],
-                    textvariable=self.series_eq_format_mode[col], width=10
-        ).grid(row=2, column=1, sticky="w", padx=(6,0), pady=(6,0))
+        format_cb = ttk.Combobox(
+            f_trend,
+            state="readonly",
+            values=["sigfigs","fixed","sci"],
+            textvariable=self.series_eq_format_mode[col],
+            width=10
+        )
+        format_cb.grid(row=2, column=1, sticky="w", padx=(6,0), pady=(6,0))
+        format_cb.bind("<<ComboboxSelected>>", self._plot_graph_event)
 
         ttk.Label(f_trend, text="Precision").grid(row=2, column=2, sticky="w")
         prec = ttk.Entry(f_trend, textvariable=self.series_eq_precision[col], width=6)
@@ -1406,6 +1550,11 @@ class GraphMaker(tk.Tk):
         f_place.pack(fill="x", pady=6)
 
         def _on_place_change():
+            place_now = self._get_series_eq_place(col)
+            if place_now == "onplot":
+                so = self.equation_styles.get(col)
+                if so:
+                    so.meta["auto_pos"] = True
             self._schedule_plot()
             self._build_series_panel(col)  # 활성/비활성 재구성
 
@@ -1414,7 +1563,7 @@ class GraphMaker(tk.Tk):
                 variable=self.series_eq_place[col], command=_on_place_change
             ).grid(row=0, column=i, padx=(0,10), sticky="w")
 
-        place = self.series_eq_place[col].get()
+        place = self._get_series_eq_place(col)
 
         # ── In Legend 선택 시: 템플릿/커스텀 편집 ──
         if place == "legend":
@@ -1900,16 +2049,27 @@ class GraphMaker(tk.Tk):
 
     # ---------- add annotation ----------
     def add_annotation(self):
-        if not self.figure: return
+        if self.figure is None:
+            self.plot_graph()
+        if not self.figure:
+            return
         self.annotations_counter += 1
         name = f"Custom Text {self.annotations_counter}"
-        ax = self.figure.axes[0]
-        cx, cy = np.mean(ax.get_xlim()), np.mean(ax.get_ylim())
+        ax = self.figure.axes[0] if self.figure.axes else None
+        if ax is not None:
+            try:
+                cx = float(np.mean(ax.get_xlim()))
+                cy = float(np.mean(ax.get_ylim()))
+            except Exception:
+                cx = cy = 0.0
+        else:
+            cx = cy = 0.0
         so = StyleableObject(
             name, 'text', StyleConfig(),
             text_var=tk.StringVar(value="New Text"),
             x_var=tk.DoubleVar(value=round(cx, 2)),
-            y_var=tk.DoubleVar(value=round(cy, 2))
+            y_var=tk.DoubleVar(value=round(cy, 2)),
+            meta={"auto_pos": True}
         )
         self.styleable_objects[name] = so
         self._refresh_custom_text_editor()
@@ -1954,9 +2114,13 @@ class GraphMaker(tk.Tk):
             obj = self.styleable_objects[name]
             if obj.x and obj.y:
                 obj.x.set(round(pos[0], 2)); obj.y.set(round(pos[1], 2))
+            if hasattr(obj, "meta"):
+                obj.meta["auto_pos"] = False
         for col, so in self.equation_styles.items():
             if self.artist_map.get(artist) == f"Equation[{col}]":
                 so.x.set(round(pos[0], 2)); so.y.set(round(pos[1], 2))
+                if hasattr(so, "meta"):
+                    so.meta["auto_pos"] = False
 
     def plot_graph(self, *args):
         if self._is_plotting:
@@ -2028,6 +2192,10 @@ class GraphMaker(tk.Tk):
             except Exception:
                 xnum = pd.to_numeric(xraw, errors="coerce").to_numpy(dtype=float)
 
+            x_finite = xnum[np.isfinite(xnum)] if isinstance(xnum, np.ndarray) else np.array([])
+            x_data_min = float(np.nanmin(x_finite)) if x_finite.size else None
+            x_data_max = float(np.nanmax(x_finite)) if x_finite.size else None
+
             # ---------- 시리즈 ----------
             for i, col in enumerate(y_cols):
                 yarr = pd.to_numeric(pdf[col], errors="coerce").to_numpy(dtype=float)
@@ -2097,7 +2265,7 @@ class GraphMaker(tk.Tk):
                     self.artist_map[tline] = f"Trendline[{col}]"
 
                 # 범례 라벨 구성
-                place = (self.series_eq_place[col].get() or "legend").lower()
+                place = self._get_series_eq_place(col)
                 if self.series_use_custom_legend[col].get():
                     lbl = (self.series_custom_legend_text[col].get() or "").strip()
                     line.set_label(lbl if lbl else series_label)
@@ -2115,24 +2283,86 @@ class GraphMaker(tk.Tk):
                 if place == "onplot":
                     so = self.equation_styles[col]
                     text_to_show = (so.text.get() or "").strip() or eq_text or f"{col}: insufficient data"
+                    auto_pos = bool(so.meta.get("auto_pos"))
                     try:
                         x0 = float(so.x.get()); y0 = float(so.y.get())
                     except Exception:
-                        x0 = y0 = 0.0
-                    if (x0 == 0.0 and y0 == 0.0) and xv.size > 0:
+                        x0 = y0 = float("nan")
+                    if auto_pos or not (math.isfinite(x0) and math.isfinite(y0)):
+                        if xv.size > 0:
+                            try:
+                                x0 = float(np.nanmean(xv))
+                                y0 = float(np.nanmax(yv))
+                                so.x.set(round(x0, 6))
+                                so.y.set(round(y0, 6))
+                                so.meta["auto_pos"] = False
+                            except Exception:
+                                pass
                         try:
-                            so.x.set(float(np.nanmean(xv)))
-                            so.y.set(float(np.nanmax(yv)))
+                            x0 = float(so.x.get()); y0 = float(so.y.get())
                         except Exception:
-                            pass
-                    a = ax.text(so.x.get(), so.y.get(), text_to_show,
+                            continue
+                        if not (math.isfinite(x0) and math.isfinite(y0)):
+                            continue
+                        if so.meta.get("auto_pos", False):
+                            continue
+                    a = ax.text(x0, y0, text_to_show,
                                 **so.style.get_font_dict(), clip_on=True)
                     try: a.set_in_layout(False)
                     except Exception: pass
-                    if so.style.underline.get():
-                        underline_targets.append((a, ax, 2))
+                    self._apply_underline(
+                        a,
+                        so.style.underline.get(),
+                        axis=ax,
+                        pad_px=2,
+                        fallback_targets=underline_targets,
+                    )
                     draggable_artists.append(a)
                     self.artist_map[a] = f"Equation[{col}]"
+
+            # ── 사용자 정의 텍스트 ──
+            for name, obj in sorted(self.styleable_objects.items()):
+                if obj.obj_type != 'text' or not name.startswith("Custom Text"):
+                    continue
+                text_val = (obj.text.get() or "").strip()
+                if not text_val:
+                    continue
+                auto_pos = bool(obj.meta.get("auto_pos"))
+                try:
+                    tx = float(obj.x.get()); ty = float(obj.y.get())
+                except Exception:
+                    tx = ty = float("nan")
+                if auto_pos or not (math.isfinite(tx) and math.isfinite(ty)):
+                    try:
+                        xlims = np.asarray(ax.get_xlim(), dtype=float)
+                        ylims = np.asarray(ax.get_ylim(), dtype=float)
+                        tx = float(np.mean(xlims)) if np.all(np.isfinite(xlims)) else 0.0
+                        ty = float(np.mean(ylims)) if np.all(np.isfinite(ylims)) else 0.0
+                        obj.x.set(round(tx, 6))
+                        obj.y.set(round(ty, 6))
+                        obj.meta["auto_pos"] = False
+                    except Exception:
+                        tx = ty = float("nan")
+                try:
+                    tx = float(obj.x.get()); ty = float(obj.y.get())
+                except Exception:
+                    continue
+                if not (math.isfinite(tx) and math.isfinite(ty)):
+                    continue
+                if obj.meta.get("auto_pos", False):
+                    continue
+                a = ax.text(tx, ty, text_val, **obj.style.get_font_dict(), clip_on=True)
+                try: a.set_in_layout(False)
+                except Exception: pass
+                self._apply_underline(
+                    a,
+                    obj.style.underline.get(),
+                    axis=ax,
+                    pad_px=2,
+                    fallback_targets=underline_targets,
+                )
+                draggable_artists.append(a)
+                self.artist_map[a] = name
 
             # ── 타이틀/축 라벨 ──
             for key in ["Title", "X-Axis Label", "Y-Axis Label"]:
@@ -2144,8 +2374,14 @@ class GraphMaker(tk.Tk):
                     a = ax.set_xlabel(obj.text.get(), **obj.style.get_font_dict())
                 elif key == "Y-Axis Label":
                     a = ax.set_ylabel(obj.text.get(), **obj.style.get_font_dict())
-                if a and obj.style.underline.get():
-                    underline_targets.append((a, ax, 2))
+                if a:
+                    self._apply_underline(
+                        a,
+                        obj.style.underline.get(),
+                        axis=ax,
+                        pad_px=2,
+                        fallback_targets=underline_targets,
+                    )
 
             # ── Tick 스타일 ──
             xts = self.styleable_objects["X-Tick Labels"].style.get_font_dict()
@@ -2154,6 +2390,24 @@ class GraphMaker(tk.Tk):
             plt.setp(ax.get_xticklabels(), fontweight=xts['fontweight'], fontstyle=xts['fontstyle'])
             ax.tick_params(axis='y', labelsize=yts['fontsize'], labelcolor=yts['color'])
             plt.setp(ax.get_yticklabels(), fontweight=yts['fontweight'], fontstyle=yts['fontstyle'])
+            x_tick_ul = self.styleable_objects["X-Tick Labels"].style.underline.get()
+            for lbl in ax.get_xticklabels():
+                self._apply_underline(
+                    lbl,
+                    x_tick_ul,
+                    axis=ax,
+                    pad_px=1,
+                    fallback_targets=underline_targets,
+                )
+            y_tick_ul = self.styleable_objects["Y-Tick Labels"].style.underline.get()
+            for lbl in ax.get_yticklabels():
+                self._apply_underline(
+                    lbl,
+                    y_tick_ul,
+                    axis=ax,
+                    pad_px=1,
+                    fallback_targets=underline_targets,
+                )
             if self.rotate_y_ticks_90.get():
                 plt.setp(ax.get_yticklabels(), rotation=90, va='center')
 
@@ -2167,30 +2421,130 @@ class GraphMaker(tk.Tk):
             except Exception:
                 pass
 
-            try:
-                if x_is_datetime:
-                    xmin_dt = pd.to_datetime(self.x_min.get(), errors="coerce")
-                    xmax_dt = pd.to_datetime(self.x_max.get(), errors="coerce")
-                    if pd.notna(xmin_dt) and pd.notna(xmax_dt):
-                        ax.set_xlim(mdates.date2num(xmin_dt.to_pydatetime()),
-                                    mdates.date2num(xmax_dt.to_pydatetime()))
-                    locator = mdates.AutoDateLocator()
+            if x_is_datetime:
+                xmin_dt = pd.to_datetime(self.x_min.get(), errors="coerce")
+                xmax_dt = pd.to_datetime(self.x_max.get(), errors="coerce")
+                xmin_num = None
+                xmax_num = None
+                if pd.notna(xmin_dt):
+                    try:
+                        xmin_num = mdates.date2num(xmin_dt.to_pydatetime())
+                    except Exception:
+                        xmin_num = None
+                if pd.notna(xmax_dt):
+                    try:
+                        xmax_num = mdates.date2num(xmax_dt.to_pydatetime())
+                    except Exception:
+                        xmax_num = None
+                if xmin_num is None:
+                    xmin_num = x_data_min
+                if xmax_num is None:
+                    xmax_num = x_data_max
+                if xmin_num is not None and xmax_num is not None:
+                    left = float(min(xmin_num, xmax_num))
+                    right = float(max(xmin_num, xmax_num))
+                    if math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12):
+                        pad = 1.0
+                        left -= pad
+                        right += pad
+                    ax.set_xlim(left, right)
+                locator = mdates.AutoDateLocator()
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
+                ax.xaxis_date()
+            else:
+                def _coerce_float(value):
+                    try:
+                        val = float(value)
+                    except Exception:
+                        return None
+                    return val if math.isfinite(val) else None
+
+                xmin_val = _coerce_float(self.x_min.get())
+                xmax_val = _coerce_float(self.x_max.get())
+                xint_val = _coerce_float(self.x_interval.get())
+
+                if xmin_val is None and x_data_min is not None:
+                    xmin_val = x_data_min
+                if xmax_val is None and x_data_max is not None:
+                    xmax_val = x_data_max
+                if xmin_val is None and xmax_val is None and x_data_min is not None and x_data_max is not None:
+                    xmin_val, xmax_val = x_data_min, x_data_max
+                elif xmin_val is None and xmax_val is not None:
+                    xmin_val = x_data_min if x_data_min is not None else xmax_val
+                elif xmax_val is None and xmin_val is not None:
+                    xmax_val = x_data_max if x_data_max is not None else xmin_val
+
+                x_bounds = None
+                if xmin_val is not None and xmax_val is not None:
+                    left = float(min(xmin_val, xmax_val))
+                    right = float(max(xmin_val, xmax_val))
+                    if math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12):
+                        pad = abs(left) * 0.05 if left != 0 else 1.0
+                        if not math.isfinite(pad) or pad <= 0:
+                            pad = 1.0
+                        left -= pad
+                        right += pad
+                    x_bounds = (left, right)
+                elif xmin_val is not None:
+                    left = float(xmin_val)
+                    pad = abs(left) * 0.05 if left != 0 else 1.0
+                    if not math.isfinite(pad) or pad <= 0:
+                        pad = 1.0
+                    x_bounds = (left - pad, left + pad)
+                elif xmax_val is not None:
+                    right = float(xmax_val)
+                    pad = abs(right) * 0.05 if right != 0 else 1.0
+                    if not math.isfinite(pad) or pad <= 0:
+                        pad = 1.0
+                    x_bounds = (right - pad, right + pad)
+                elif x_data_min is not None and x_data_max is not None:
+                    left = float(min(x_data_min, x_data_max))
+                    right = float(max(x_data_min, x_data_max))
+                    if math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12):
+                        pad = abs(left) * 0.05 if left != 0 else 1.0
+                        if not math.isfinite(pad) or pad <= 0:
+                            pad = 1.0
+                        left -= pad
+                        right += pad
+                    x_bounds = (left, right)
+
+                x_left_limit = None
+                if x_bounds is not None:
+                    ax.set_xlim(*x_bounds)
+                    try:
+                        x_left_limit = ax.get_xlim()[0]
+                    except Exception:
+                        x_left_limit = x_bounds[0]
+
+                if xint_val is not None and xint_val > 0:
+                    locator = mticker.MultipleLocator(xint_val)
+                    offset_target = x_left_limit if x_left_limit is not None else x_data_min
+                    if offset_target is not None and math.isfinite(offset_target):
+                        try:
+                            locator.set_params(offset=offset_target)
+                        except Exception:
+                            try:
+                                locator.offset = offset_target
+                            except Exception:
+                                pass
                     ax.xaxis.set_major_locator(locator)
-                    ax.xaxis.set_major_formatter(mdates.AutoDateFormatter(locator))
-                    ax.xaxis_date()
-                else:
-                    xmin, xmax = float(self.x_min.get()), float(self.x_max.get())
-                    xint = float(self.x_interval.get())
-                    ax.set_xlim(xmin, xmax)
-                    if xint > 0:
-                        ax.xaxis.set_major_locator(mticker.MultipleLocator(xint))
-            except Exception:
-                pass
 
             # ── 그리드/범례 ──
             ax.grid(False)
-            if self.show_x_grid.get(): ax.xaxis.grid(True, linestyle='--', alpha=0.5)
-            if self.show_y_grid.get(): ax.yaxis.grid(True, linestyle='--', alpha=0.5)
+            grid_kwargs = {"linestyle": "--", "alpha": 0.5}
+            if self.show_x_grid.get():
+                ax.xaxis.grid(True, **grid_kwargs)
+            else:
+                ax.xaxis.grid(False)
+            if self.show_y_grid.get():
+                ax.yaxis.grid(True, **grid_kwargs)
+            else:
+                ax.yaxis.grid(False)
+            try:
+                ax.set_axisbelow(True)
+            except Exception:
+                pass
 
             if self.show_legend.get():
                 try: fs = float(self.legend_fontsize.get())
