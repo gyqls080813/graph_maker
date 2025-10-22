@@ -3,7 +3,6 @@ from tkinter import filedialog, ttk, colorchooser
 import pandas as pd
 import math
 import numpy as np
-import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -747,21 +746,6 @@ class GraphMaker(tk.Tk):
         return [c for c in selected if c != x]
 
 
-    def _ensure_series_state_attrs(self):
-        """시리즈 관련 상태 딕셔너리가 항상 존재하도록 보장"""
-        if not hasattr(self, "series_styles"):               self.series_styles = {}
-        if not hasattr(self, "trendline_styles"):            self.trendline_styles = {}
-        if not hasattr(self, "equation_styles"):             self.equation_styles = {}
-        if not hasattr(self, "series_show_trend"):           self.series_show_trend = {}
-        if not hasattr(self, "series_show_eq"):              self.series_show_eq = {}
-        if not hasattr(self, "series_eq_in_legend"):         self.series_eq_in_legend = {}
-
-        # 레전드/식 관련 부가 상태
-        if not hasattr(self, "series_custom_legend_text"):   self.series_custom_legend_text = {}
-        if not hasattr(self, "series_use_custom_legend"):    self.series_use_custom_legend = {}
-        if not hasattr(self, "series_last_eq"):              self.series_last_eq = {}
-        if not hasattr(self, "series_eq_auto_update"):       self.series_eq_auto_update = {}
-
     def _ensure_series_objects(self, y_cols):
         # 기본 딕셔너리 존재 보장
         if not hasattr(self, "series_styles"):               self.series_styles = {}
@@ -843,43 +827,6 @@ class GraphMaker(tk.Tk):
 
 
 
-    def _safe_int(self, var_or_str, default):
-        try:
-            v = var_or_str.get() if hasattr(var_or_str, "get") else var_or_str
-            return int(v)
-        except Exception:
-            return default
-
-    def _safe_float(self, var_or_str, default):
-        try:
-            v = var_or_str.get() if hasattr(var_or_str, "get") else var_or_str
-            return float(v)
-        except Exception:
-            return default
-
-    def _format_equation(self, col, m, c, r2):
-        mode = (self.series_eq_fmt_mode[col].get() or 'sigfigs').lower()
-        prec = max(0, self._safe_int(self.series_eq_precision[col], 3))
-        xs  = self.series_eq_xsym[col].get().strip() or 'x'
-        ys  = self.series_eq_ysym[col].get().strip() or 'y'
-        thr = abs(self._safe_float(self.series_eq_zero_thr[col], 0.0))
-
-        fmt = f".{prec}g" if mode == 'sigfigs' else f".{prec}f"
-        m_s  = format(m, fmt)
-        c_s  = format(c, fmt)
-
-        # intercept 표시 여부
-        show_c = (abs(c) > thr)
-        sign = " + " if c >= 0 else " - "
-        eq = f"{ys} = {m_s}{xs}"
-        if show_c:
-            eq += f"{sign}{c_s.lstrip('-')}"
-
-        if self.series_eq_show_r2[col].get() and (r2 is not None):
-            r2_s = format(r2, fmt)
-            eq += f"  (R²={r2_s})"
-        return eq
-
     def _refresh_axis_selectors(self):
         cols = self._available_columns()
 
@@ -917,6 +864,17 @@ class GraphMaker(tk.Tk):
             widget.pack(anchor="center", padx=10, pady=10)
         else:
             widget.pack(fill="both", expand=True)
+
+    def _finalize_canvas(self, underline_targets, draggable_artists=None):
+        """공통적인 캔버스 렌더링/드래그 연결 처리를 담당."""
+        self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
+        self.canvas.draw()
+        for artist, axis, pad in underline_targets:
+            self._add_underline_line(artist, axis, pad_px=pad)
+        self.canvas.draw()
+        self._mount_canvas()
+        if draggable_artists:
+            self.dragger = DraggableArtist(draggable_artists, self.update_object_position)
 
     def _create_widgets(self):
         main = ttk.Frame(self); main.pack(fill="both", expand=True, padx=10, pady=10)
@@ -1507,17 +1465,6 @@ class GraphMaker(tk.Tk):
         self.styleable_objects["X-Tick Labels"] = StyleableObject("X-Tick Labels", 'tick', StyleConfig())
         self.styleable_objects["Y-Tick Labels"] = StyleableObject("Y-Tick Labels", 'tick', StyleConfig())
 
-    def open_data_selector(self):
-        if self.df is None:
-            return
-        sel = DataSelector(self, self.df)
-        self.wait_window(sel)
-
-        # 선택된 컬럼 기준으로 X/Y 동기화
-        self._map_columns_from_selection()
-        self._refresh_axis_selectors()
-        self._schedule_axis_and_plot()
-
     def _map_columns_from_selection(self):
         """self.selected_columns: X=첫 번째, Y=그 외로 UI 반영"""
         if self.df is None:
@@ -1598,11 +1545,8 @@ class GraphMaker(tk.Tk):
             return
         sel = DataSelector(self, self.df)
         self.wait_window(sel)
-        # 선택한 행/열 기반으로 X/Y 후보 재선정
+        # 선택한 행/열 기반으로 X/Y 후보 재선정 및 축 갱신
         self._auto_pick_xy_from_selection()
-        # 축/플롯 갱신
-        self._refresh_axis_selectors()
-        self._auto_pick_xy_from_selection()   # <- 추가
         self._schedule_axis_and_plot()
 
     def _is_numeric_series(self, s) -> bool:
@@ -1826,20 +1770,6 @@ class GraphMaker(tk.Tk):
             return pd.DataFrame()
         return self.df.iloc[s0:e0+1].copy()
 
-    # ---------- axis defaults ----------
-    def _calculate_axis_defaults(self, data_min, data_max):
-        if data_min is None or data_max is None or pd.isna(data_min) or pd.isna(data_max):
-            return "0", "10", "2"
-        nice_min = 0
-        rng = data_max - nice_min
-        if rng <= 0: rng = data_max
-        power = 10 ** math.floor(math.log10(rng if rng > 0 else 1))
-        nice_max = math.ceil(data_max / power) * power
-        if nice_max <= nice_min: nice_max = data_max + power
-        interval = (nice_max - nice_min) / 10.0
-        if interval <= 0: interval = 1.0
-        return str(nice_min), str(round(nice_max, 2)), str(round(interval, 2))
-
     def on_x_change(self, *a):
         if getattr(self, "_booting", True) or getattr(self, "_suspend_callbacks", False):
             return
@@ -2002,38 +1932,31 @@ class GraphMaker(tk.Tk):
             try:
                 w_in = max(float(self.figure_width_cm.get()) / 2.54, 2.0)
                 h_in = max(float(self.figure_height_cm.get()) / 2.54, 2.0)
-                self.figure, ax = plt.subplots(figsize=(w_in, h_in),
-                                            dpi=self.screen_dpi,
-                                            constrained_layout=True)
+                self.figure, ax = plt.subplots(
+                    figsize=(w_in, h_in), dpi=self.screen_dpi, constrained_layout=True
+                )
             except Exception:
                 self.figure, ax = plt.subplots(dpi=self.screen_dpi, constrained_layout=True)
 
+            underline_targets = []  # (artist, ax, pad_px)
+            draggable_artists = []
+            self.artist_map = {}
+
+            def render_placeholder(message: str):
+                ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
+                self._finalize_canvas([])
+
             # 데이터 체크
             if self.df is None:
-                t = ax.text(0.5, 0.5, "Please load a file.", ha='center', va='center', transform=ax.transAxes)
-                underline_targets = []
-                # (필요 시) 타이틀 등에도 밑줄을 추가하려면 targets에 append
-                self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
-                self.canvas.draw()  # 1차 draw
-                for a, aax, pad in underline_targets:
-                    self._add_underline_line(a, aax, pad_px=pad)
-                self.canvas.draw()  # 2차 draw
-                self._mount_canvas()
+                render_placeholder("Please load a file.")
                 return
 
-            pdf   = self._get_plotting_df()
+            pdf = self._get_plotting_df()
             xname = self.x_col.get()
             y_cols = self._get_selected_y_cols()
 
             if pdf.empty or (not xname) or (not y_cols):
-                t = ax.text(0.5, 0.5, "Select X and Y columns to plot.", ha='center', va='center', transform=ax.transAxes)
-                underline_targets = []
-                self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
-                self.canvas.draw()  # 1차 draw
-                for a, aax, pad in underline_targets:
-                    self._add_underline_line(a, aax, pad_px=pad)
-                self.canvas.draw()  # 2차 draw
-                self._mount_canvas()
+                render_placeholder("Select X and Y columns to plot.")
                 return
 
             self._ensure_series_objects(y_cols)
@@ -2050,10 +1973,6 @@ class GraphMaker(tk.Tk):
                     xnum = pd.to_numeric(xraw, errors="coerce").to_numpy(dtype=float)
             except Exception:
                 xnum = pd.to_numeric(xraw, errors="coerce").to_numpy(dtype=float)
-
-            draggable_artists = []
-            self.artist_map = {}
-            underline_targets = []  # (artist, ax, pad_px)
 
             # ---------- 시리즈 ----------
             for i, col in enumerate(y_cols):
@@ -2238,21 +2157,7 @@ class GraphMaker(tk.Tk):
                     frame.set_edgecolor(self.legend_edgecolor.get())
                     frame.set_facecolor(self.legend_facecolor.get())
 
-            # ── 1차 렌더: 텍스트 bbox 확정 ──
-            self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
-            self.canvas.draw()
-
-            # ── 밑줄 생성 ──
-            for a, aax, pad in underline_targets:
-                self._add_underline_line(a, aax, pad_px=pad)
-
-            # ── 2차 렌더: 밑줄 반영 ──
-            self.canvas.draw()
-            self._mount_canvas()
-
-            # 드래그 연결
-            if draggable_artists:
-                self.dragger = DraggableArtist(draggable_artists, self.update_object_position)
+            self._finalize_canvas(underline_targets, draggable_artists)
 
         finally:
             self._is_plotting = False
